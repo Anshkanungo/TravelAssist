@@ -1,0 +1,43 @@
+# Environment files
+.env
+venv/
+
+# Python specific files
+*.pyc
+*.pyo
+__pycache__/
+*.pyd
+*.pdb
+
+# IDE-specific files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.bak
+*.orig
+*.DS_Store
+Thumbs.db
+
+# Dependencies
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# Test coverage files
+.coverage
+.cache/
+.tox/
+
+# Output and package files
+*.tar
+*.gz
+*.zip
+*.whl
