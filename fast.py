@@ -1,27 +1,25 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Dict
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Union
 from langchain_google_genai import GoogleGenerativeAI
-from datetime import datetime
-from dotenv import load_dotenv
 import os
-
+import re
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
 
-
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Pydantic models for request validation
+# Request Models
 class TripCategory(BaseModel):
     pilgrimage: bool = False
     historical: bool = False
@@ -47,13 +45,18 @@ class Sightseeing(BaseModel):
     exclude: bool = False
 
 class DateOfTravel(BaseModel):
-    # Changed from 'from_date' to 'from' to match JSON structure
-    from_: str = None  # Using from_ because 'from' is a Python keyword
+    from_: str = Field(alias="from")
     to: str
 
-    class Config:
-        # This tells Pydantic to use 'from' in JSON instead of 'from_'
-        fields = {'from_': 'from'}
+    model_config = {
+        "populate_by_name": True,
+        "json_schema_extra": {
+            "example": {
+                "from": "2025-01-14",
+                "to": "2025-01-23"
+            }
+        }
+    }
 
 class HotelType(BaseModel):
     star: int
@@ -91,11 +94,29 @@ class TripDetails(BaseModel):
 class TravelRequest(BaseModel):
     tripDetails: TripDetails
 
-class TravelResponse(BaseModel):
-    itinerary: str
-    activities: List[str]
+# Response Models
+class Activity(BaseModel):
+    time: str
+    activity: str
 
-# Helper functions (reused from your original code)
+class DayItinerary(BaseModel):
+    day: str
+    activities: List[Activity]
+
+class TransportationRecommendation(BaseModel):
+    mode: str
+    route: str
+
+class AdditionalInfo(BaseModel):
+    Transportation_Recommendations: List[TransportationRecommendation]
+    Budget_Allocation_Recommendations: Dict[str, str]
+    Special_Considerations: List[str]
+
+class TravelResponse(BaseModel):
+    itinerary: Optional[List[Union[DayItinerary, AdditionalInfo]]] = None
+    activities: Optional[List[str]] = None
+
+# Helper Functions
 def generate_activities_prompt(destination: str, categories: List[str]) -> str:
     return f"""
     Please provide a comprehensive list of all possible activities and attractions in {destination}. 
@@ -107,6 +128,89 @@ def generate_activities_prompt(destination: str, categories: List[str]) -> str:
     
     Format the response as a Python list of strings, with each activity as a separate item.
     """
+
+def parse_itinerary_response(llm_response: str) -> List[Union[Dict, Dict]]:
+    sections = llm_response.split('\n\n')
+    itinerary = []
+    current_day = None
+    special_section = {}
+
+    for section in sections:
+        if not section.strip():
+            continue
+
+        # Handle day sections
+        if section.startswith('**Day'):
+            if current_day:
+                itinerary.append(current_day)
+            
+            day_title = section.split('\n')[0].strip('*').strip()
+            current_day = {
+                "day": day_title,
+                "activities": []
+            }
+            
+            # Updated regex pattern to better match the LLM's output format
+            activities = re.findall(r'\* \*\*([\w\s]+):\*\* (.*?)(?=\n|$)', section, re.DOTALL)
+            if not activities:
+                # Alternative pattern if the first one doesn't match
+                activities = re.findall(r'\*\*([\w\s]+):\*\* (.*?)(?=\n(?:\*|$)|$)', section, re.DOTALL)
+            
+            for time, activity in activities:
+                current_day["activities"].append({
+                    "time": time.strip(),
+                    "activity": activity.strip()
+                })
+        
+        # Handle Transportation Recommendations
+        elif 'Transportation Recommendations' in section:
+            transport_items = re.findall(r'\* (.*?)(?=\n|$)', section)
+            if not transport_items:
+                transport_items = re.findall(r'(?<=:)\s*(.*?)(?=\n|$)', section)
+            
+            special_section["Transportation_Recommendations"] = [
+                {"mode": item.split(':', 1)[0].strip() if ':' in item else item,
+                 "route": item.split(':', 1)[1].strip() if ':' in item else ""} 
+                for item in transport_items if item.strip()
+            ]
+        
+        # Handle Budget Allocation
+        elif 'Budget Allocation' in section:
+            # Try to match either bullet points or plain text format
+            budget_items = re.findall(r'\* (.*?): (.*?)(?=\n|$)', section)
+            if not budget_items:
+                budget_items = re.findall(r'([\w\s]+): ([\d,]+\s*(?:INR|USD|EUR))', section)
+            
+            special_section["Budget_Allocation_Recommendations"] = {
+                item[0].strip().replace(" ", "_"): item[1].strip()
+                for item in budget_items if len(item) == 2
+            }
+        
+        # Handle Special Considerations
+        elif 'Special Considerations' in section:
+            considerations = re.findall(r'\* (.*?)(?=\n|$)', section)
+            if not considerations:
+                considerations = section.split('\n')[1:]  # Skip the header
+            
+            special_section["Special_Considerations"] = [
+                consid.strip('* ').strip()
+                for consid in considerations 
+                if consid.strip('* ').strip()
+            ]
+
+    # Add the last day if exists
+    if current_day:
+        itinerary.append(current_day)
+    
+    # Only add special section if it has content
+    if any(special_section.values()):
+        itinerary.append(special_section)
+
+    # Debug print to see the raw LLM response
+    print("Raw LLM Response:")
+    print(llm_response)
+    
+    return itinerary
 
 def parse_llm_activities(llm_response: str) -> List[str]:
     try:
@@ -131,9 +235,15 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
 
     return f"""
     Create a detailed travel itinerary for a trip to {trip_details.destination} from {trip_details.dateOfTravel.from_} to {trip_details.dateOfTravel.to}. 
-    Consider the following preferences and requirements:
-    create plan for only selected days and set the departure on the last day itself.
+    Please format the output exactly as shown in this example:
 
+    **Day 1 (YYYY-MM-DD)**
+    * **Morning:** Activity description here
+    * **Afternoon:** Activity description here
+    * **Evening:** Activity description here
+    * **Dinner:** Restaurant recommendation here
+
+    Consider these preferences and requirements:
     Trip Categories: {', '.join(categories)}
     Group Size: {trip_details.numberOfPeople.adults} adults, {trip_details.numberOfPeople.children} children, {trip_details.numberOfPeople.infants} infants
     Transportation Preferences: {', '.join(travel_modes)}
@@ -142,19 +252,26 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
     Dietary Preferences: {meal_preferences}
     Additional Requirements: {trip_details.extraRequirements}
 
-    Please provide:
-    1. A day-by-day itinerary with recommended activities and attractions with timestamps
-    2. Suggested restaurants that match the dietary preferences and is close to chosen activty of the day
-    3. Transportation recommendations between attractions
-    4. Estimated time requirements for each activity
-    5. Any special considerations for {"children " if has_children else ""}the group
-    6. Budget allocation recommendations
+    After the day-by-day itinerary, please include:
 
-    Focus on activities that match the selected categories and accommodate any mobility or dietary restrictions mentioned.
-    Order activities by the preferences indicated in the trip categories.
+    **Transportation Recommendations:**
+    * Mode: Details
+    * Mode: Details
+
+    **Budget Allocation Recommendations:**
+    * Flights: Amount
+    * Accommodation: Amount
+    * Transportation: Amount
+    * Activities: Amount
+    * Food: Amount
+    * Miscellaneous: Amount
+
+    **Special Considerations:**
+    * Consideration 1
+    * Consideration 2
+    * Consideration 3
     """
 
-# Setup LLM
 def setup_llm():
     return GoogleGenerativeAI(
         model="gemini-pro",
@@ -162,26 +279,31 @@ def setup_llm():
         temperature=0.2
     )
 
-# API endpoints
-@app.post("/generate-travel-plan", response_model=TravelResponse)
-async def generate_travel_plan(request: TravelRequest):
+# API Endpoints
+@app.post("/generate-activities", response_model=TravelResponse)
+async def generate_activities(request: TravelRequest):
     try:
         llm = setup_llm()
         
-        # Generate activities list
         categories = [cat for cat, val in request.tripDetails.category.dict().items() if val]
         activities_prompt = generate_activities_prompt(request.tripDetails.destination, categories)
         activities_response = llm(activities_prompt)
         activities_list = parse_llm_activities(activities_response)
         
-        # Generate itinerary
+        return TravelResponse(activities=activities_list)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate-itinerary", response_model=TravelResponse)
+async def generate_itinerary(request: TravelRequest):
+    try:
+        llm = setup_llm()
+        
         itinerary_prompt = generate_llm_prompt(request.tripDetails)
         itinerary_response = llm(itinerary_prompt)
+        parsed_itinerary = parse_itinerary_response(itinerary_response)
         
-        return TravelResponse(
-            itinerary=itinerary_response,
-            activities=activities_list
-        )
+        return TravelResponse(itinerary=parsed_itinerary)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
