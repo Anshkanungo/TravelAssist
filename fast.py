@@ -213,19 +213,50 @@ def parse_itinerary_response(llm_response: str) -> List[Union[Dict, Dict]]:
     return itinerary
 
 def parse_llm_activities(llm_response: str) -> List[str]:
+    """
+    Parses the LLM response for activities and returns a clean list of strings.
+    Removes markdown code blocks, quotation marks, and other formatting artifacts.
+    """
     try:
-        clean_response = llm_response.strip()
-        if clean_response.startswith("```python"):
-            clean_response = clean_response.split("```python")[1]
-        if clean_response.startswith("```"):
-            clean_response = clean_response.split("```")[1]
+        # Remove code block markers and extra whitespace
+        clean_response = llm_response.replace("```python", "").replace("```", "").strip()
         
-        activities = eval(clean_response)
-        return activities if isinstance(activities, list) else []
-    except:
-        return [line.strip().strip('*-').strip() 
-                for line in llm_response.split('\n') 
-                if line.strip() and not line.startswith('#')]
+        # If the response is a string representation of a list, evaluate it
+        if clean_response.startswith("[") and clean_response.endswith("]"):
+            try:
+                activities = eval(clean_response)
+                # Clean up each activity string
+                activities = [
+                    activity.strip('"\'')  # Remove quotes
+                    .replace('\\"', '"')   # Fix escaped quotes
+                    for activity in activities
+                    if activity and not activity.startswith("[") and not activity.endswith("]")
+                ]
+                return activities
+            except:
+                pass
+        
+        # Fallback: Split by newlines and clean up each line
+        activities = []
+        for line in clean_response.split('\n'):
+            line = line.strip()
+            # Skip empty lines, brackets, and other formatting artifacts
+            if (line and 
+                not line.startswith("[") and 
+                not line.endswith("]") and 
+                not line == "```python" and 
+                not line == "```"):
+                # Clean up the line
+                activity = (line.strip('"\'')  # Remove quotes
+                          .strip('*-')         # Remove bullets
+                          .strip())            # Remove extra whitespace
+                if activity:
+                    activities.append(activity)
+        
+        return activities
+    except Exception as e:
+        print(f"Error parsing activities: {e}")
+        return []
 
 def generate_llm_prompt(trip_details: TripDetails) -> str:
     categories = [cat for cat, val in trip_details.category.dict().items() if val]
@@ -279,31 +310,61 @@ def setup_llm():
         temperature=0.2
     )
 
+def generate_enhanced_prompt(trip_details: TripDetails, activities: List[str]) -> str:
+    """
+    Generates an enhanced prompt that incorporates both trip details and selected activities
+    to create a more cohesive itinerary.
+    """
+    base_prompt = generate_llm_prompt(trip_details)
+    
+    # Add activities context to the prompt
+    activities_context = "\nRecommended activities for this destination:\n" + "\n".join(
+        f"* {activity}" for activity in activities[:10]  # Limit to top 10 activities
+    )
+    
+    return f"""
+    {base_prompt}
+
+    {activities_context}
+
+    Please incorporate some of these recommended activities into the itinerary where appropriate, 
+    considering the following:
+    1. The activities should fit well with the daily schedule
+    2. They should align with the specified trip categories
+    3. They should be within the specified budget
+    4. They should be suitable for the group composition
+    5. They should account for meal preferences and requirements
+
+    Follow the same output format as specified in the base prompt.
+    """
+
 # API Endpoints
-@app.post("/generate-activities", response_model=TravelResponse)
-async def generate_activities(request: TravelRequest):
+@app.post("/generate-travel-plan", response_model=TravelResponse)
+async def generate_travel_plan(request: TravelRequest):
     try:
         llm = setup_llm()
         
+        # Generate activities first
         categories = [cat for cat, val in request.tripDetails.category.dict().items() if val]
-        activities_prompt = generate_activities_prompt(request.tripDetails.destination, categories)
+        activities_prompt = generate_activities_prompt(
+            request.tripDetails.destination, 
+            categories
+        )
         activities_response = llm(activities_prompt)
         activities_list = parse_llm_activities(activities_response)
         
-        return TravelResponse(activities=activities_list)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/generate-itinerary", response_model=TravelResponse)
-async def generate_itinerary(request: TravelRequest):
-    try:
-        llm = setup_llm()
-        
-        itinerary_prompt = generate_llm_prompt(request.tripDetails)
+        # Generate itinerary incorporating the activities
+        itinerary_prompt = generate_enhanced_prompt(
+            request.tripDetails,
+            activities_list
+        )
         itinerary_response = llm(itinerary_prompt)
         parsed_itinerary = parse_itinerary_response(itinerary_response)
         
-        return TravelResponse(itinerary=parsed_itinerary)
+        return TravelResponse(
+            activities=activities_list,
+            itinerary=parsed_itinerary
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
