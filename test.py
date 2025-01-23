@@ -1,22 +1,17 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Union
+import pandas as pd
 from langchain_google_genai import GoogleGenerativeAI
 import os
 import re
+import openpyxl
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from pymongo import MongoClient
-from bson import ObjectId
-
 load_dotenv()
 
+
 app = FastAPI()
-
-
-client = MongoClient(os.environ.get('MONGODB_URI'))  # Use environment variable
-db = client.get_database('syt_final')  # Your database name
-hotels_collection = db.hotel_syts
 
 # Add CORS middleware
 app.add_middleware(
@@ -125,7 +120,10 @@ class HotelRoom(BaseModel):
     price: float
 
 class HotelInfo(BaseModel):
-    hotel_id: str
+    name: str
+    rooms: List[HotelRoom]
+    amenities: List[str]
+    overview: str
 
 class Activity(BaseModel):
     time: str
@@ -133,7 +131,7 @@ class Activity(BaseModel):
 
 class DayItinerary(BaseModel):
     day: str
-    hotel_id: str  # Changed from hotel: HotelInfo to hotel_id: str
+    hotel: HotelInfo
     activities: List[Activity]
     Transportation_Recommendations: Optional[List[TransportationRecommendation]] = None
     Budget_Allocation_Recommendations: Optional[Dict[str, str]] = None
@@ -141,30 +139,69 @@ class DayItinerary(BaseModel):
 
 class TravelResponse(BaseModel):
     itinerary: List[DayItinerary]
-    hotel_ids: List[str]  # Changed from hotels: List[HotelInfo]
+    hotels: List[HotelInfo]
     activities: List[str]
 
-def get_matching_hotels(hotel_type: int, destination_city: str) -> List[str]:
-    """Get hotel ObjectIds matching the criteria from MongoDB"""
+def load_hotel_data():
+    """Load hotel data from Excel file"""
     try:
-        query = {
-            'hotel_type': hotel_type,
-            'city': destination_city.strip()  # Trim whitespace
-        }
-        
-        print(f"MongoDB Query: {query}")  # Debug log
-        
-        matching_hotels = hotels_collection.find(query)
-        
-        # Convert ObjectIds to strings and return as list
-        hotel_ids = [str(hotel['_id']) for hotel in matching_hotels]
-        
-        print(f"Found {len(hotel_ids)} matching hotels")  # Debug log
-        return hotel_ids
+        df = pd.read_excel("Hotels.xlsx")
+        # Print the columns to debug
+        print("Available columns in Excel file:", df.columns.tolist())
+        return df
     except Exception as e:
-        print(f"Error querying MongoDB: {e}")
-        return []
+        print(f"Error loading hotel data: {e}")
+        print(f"Current working directory: {os.getcwd()}")
+        return None
+def format_hotel_data(hotel_df: pd.DataFrame, star_rating: int) -> List[HotelInfo]:
+    """Format hotel data according to the structure, matching room types with their corresponding prices"""
+    try:
+        filtered_hotels = hotel_df[hotel_df['Star'] == star_rating].copy()
 
+        hotels_list = []
+        for _, row in filtered_hotels.iterrows():
+            try:
+                # Parse room types
+                room_types = [type.strip() for type in row['RoomTypes'].split(',')]
+                
+                # Get all price columns (Price1, Price2, etc.)
+                price_columns = [col for col in row.index if col.startswith('Price') and not pd.isna(row[col])]
+                prices = [float(row[price_col]) for price_col in price_columns]
+                
+                # Create room objects by pairing types with prices
+                # Make sure we have matching number of prices and room types
+                rooms = []
+                for i, room_type in enumerate(room_types):
+                    # Use corresponding price if available, otherwise use last available price
+                    price = prices[i] if i < len(prices) else prices[-1]
+                    rooms.append(
+                        HotelRoom(
+                            type=room_type,
+                            price=price
+                        )
+                    )
+                
+                # Parse amenities
+                amenities = [amenity.strip() for amenity in row['Amenities'].split(',')]
+                
+                hotel = HotelInfo(
+                    name=row['HotelName'],
+                    rooms=rooms,
+                    amenities=amenities,
+                    overview=row.get('Overview', 'No overview available')
+                )
+                hotels_list.append(hotel)
+                
+            except Exception as e:
+                print(f"Error processing hotel row: {e}")
+                print(f"Row data: {row}")
+                continue
+
+        return hotels_list
+    except Exception as e:
+        print(f"Error in format_hotel_data: {e}")
+        print(f"DataFrame columns: {hotel_df.columns}")
+        return []
 
 
 
@@ -181,7 +218,7 @@ def generate_activities_prompt(destination: str, categories: List[str]) -> str:
     Format the response as a Python list of strings, with each activity as a separate item.
     """
 
-def parse_itinerary_response(llm_response: str, hotel_id: str) -> List[DayItinerary]:
+def parse_itinerary_response(llm_response: str, selected_hotel: HotelInfo) -> List[DayItinerary]:
     sections = llm_response.split('\n\n')
     itinerary = []
     current_day = None
@@ -191,14 +228,16 @@ def parse_itinerary_response(llm_response: str, hotel_id: str) -> List[DayItiner
         if not section.strip():
             continue
 
+        # Handle day sections
         if section.startswith('**Day'):
             if current_day:
-                current_day["hotel_id"] = hotel_id  # Changed from hotel to hotel_id
+                # Add hotel and any special sections to the current day
+                current_day["hotel"] = selected_hotel
                 if special_section:
                     current_day.update(special_section)
                 itinerary.append(DayItinerary(**current_day))
                 special_section = {}
-            
+
             day_title = section.split('\n')[0].strip('*').strip()
             current_day = {
                 "day": day_title,
@@ -207,18 +246,18 @@ def parse_itinerary_response(llm_response: str, hotel_id: str) -> List[DayItiner
                 "Budget_Allocation_Recommendations": None,
                 "Special_Considerations": None
             }
-            
+
             activities = re.findall(r'\* \*\*([\w\s]+):\*\* (.*?)(?=\n|$)', section, re.DOTALL)
             if not activities:
                 activities = re.findall(r'\*\*([\w\s]+):\*\* (.*?)(?=\n(?:\*|$)|$)', section, re.DOTALL)
-            
+
             for time, activity in activities:
                 current_day["activities"].append(Activity(
                     time=time.strip(),
                     activity=activity.strip()
                 ))
-        
-        # Handle special sections (keep the same as before)
+
+        # Handle special sections
         elif 'Transportation Recommendations' in section:
             transport_items = re.findall(r'\* (.*?)(?=\n|$)', section)
             special_section["Transportation_Recommendations"] = [
@@ -228,14 +267,14 @@ def parse_itinerary_response(llm_response: str, hotel_id: str) -> List[DayItiner
                 )
                 for item in transport_items if item.strip()
             ]
-        
+
         elif 'Budget Allocation' in section:
             budget_items = re.findall(r'\* (.*?): (.*?)(?=\n|$)', section)
             special_section["Budget_Allocation_Recommendations"] = {
                 item[0].strip().replace(" ", "_"): item[1].strip()
                 for item in budget_items if len(item) == 2
             }
-        
+
         elif 'Special Considerations' in section:
             considerations = re.findall(r'\* (.*?)(?=\n|$)', section)
             special_section["Special_Considerations"] = [
@@ -246,13 +285,12 @@ def parse_itinerary_response(llm_response: str, hotel_id: str) -> List[DayItiner
 
     # Add the last day if exists
     if current_day:
-        current_day["hotel_id"] = hotel_id  # Changed from hotel to hotel_id
+        current_day["hotel"] = selected_hotel
         if special_section:
             current_day.update(special_section)
         itinerary.append(DayItinerary(**current_day))
 
     return itinerary
-
 
 
 
@@ -271,18 +309,14 @@ def generate_enhanced_prompt(trip_details: TripDetails, activities: List[str], h
 
     base_prompt = f"""
     Create a detailed travel itinerary for a trip to {trip_details.destination} from {trip_details.dateOfTravel.from_} to {trip_details.dateOfTravel.to}. 
-
     Available {trip_details.hotelType.star}-star Hotels:
     {hotels_info}
-
     Please format the output exactly as shown in this example:
-
     **Day 1 (YYYY-MM-DD)**
     * **Morning:** Activity description here
     * **Afternoon:** Activity description here
     * **Evening:** Activity description here
     * **Dinner:** Restaurant recommendation here
-
     Consider these preferences and requirements:
     Trip Categories: {', '.join(cat for cat, val in trip_details.category.dict().items() if val)}
     Group Size: {trip_details.numberOfPeople.adults} adults, {trip_details.numberOfPeople.children} children, {trip_details.numberOfPeople.infants} infants
@@ -291,16 +325,14 @@ def generate_enhanced_prompt(trip_details: TripDetails, activities: List[str], h
     Dietary Preferences: {"vegetarian" if trip_details.mealsType.veg else "non-vegetarian"}
     Additional Requirements: {trip_details.extraRequirements}
     """
-    
+
     activities_context = "\nRecommended activities for this destination:\n" + "\n".join(
         f"* {activity}" for activity in activities[:10]
     )
-    
+
     return f"""
     {base_prompt}
-
     {activities_context}
-
     Please incorporate some of these recommended activities into the itinerary where appropriate, 
     considering the following:
     1. The activities should fit well with the daily schedule
@@ -308,13 +340,10 @@ def generate_enhanced_prompt(trip_details: TripDetails, activities: List[str], h
     3. They should be within the specified budget
     4. They should be suitable for the group composition
     5. They should account for meal preferences and requirements
-
     After the day-by-day itinerary, please include:
-
     **Transportation Recommendations:**
     * Mode: Details
     * Mode: Details
-
     **Budget Allocation Recommendations:**
     * Hotel: Estimated {hotels[0].rooms[0].price if hotels and hotels[0].rooms else 'N/A'} per night
     * Flights: Amount
@@ -322,7 +351,6 @@ def generate_enhanced_prompt(trip_details: TripDetails, activities: List[str], h
     * Activities: Amount
     * Food: Amount
     * Miscellaneous: Amount
-
     **Special Considerations:**
     * Consideration 1
     * Consideration 2
@@ -337,7 +365,7 @@ def parse_llm_activities(llm_response: str) -> List[str]:
     try:
         # Remove code block markers and extra whitespace
         clean_response = llm_response.replace("```python", "").replace("```", "").strip()
-        
+
         # If the response is a string representation of a list, evaluate it
         if clean_response.startswith("[") and clean_response.endswith("]"):
             try:
@@ -352,7 +380,7 @@ def parse_llm_activities(llm_response: str) -> List[str]:
                 return activities
             except:
                 pass
-        
+
         # Fallback: Split by newlines and clean up each line
         activities = []
         for line in clean_response.split('\n'):
@@ -369,7 +397,7 @@ def parse_llm_activities(llm_response: str) -> List[str]:
                           .strip())            # Remove extra whitespace
                 if activity:
                     activities.append(activity)
-        
+
         return activities
     except Exception as e:
         print(f"Error parsing activities: {e}")
@@ -384,13 +412,11 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
     return f"""
     Create a detailed travel itinerary for a trip to {trip_details.destination} from {trip_details.dateOfTravel.from_} to {trip_details.dateOfTravel.to}. 
     Please format the output exactly as shown in this example:
-
     **Day 1 (YYYY-MM-DD)**
     * **Morning:** Activity description here
     * **Afternoon:** Activity description here
     * **Evening:** Activity description here
     * **Dinner:** Restaurant recommendation here
-
     Consider these preferences and requirements:
     Trip Categories: {', '.join(categories)}
     Group Size: {trip_details.numberOfPeople.adults} adults, {trip_details.numberOfPeople.children} children, {trip_details.numberOfPeople.infants} infants
@@ -399,13 +425,10 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
     Budget: {trip_details.userDetails.budget}
     Dietary Preferences: {meal_preferences}
     Additional Requirements: {trip_details.extraRequirements}
-
     After the day-by-day itinerary, please include:
-
     **Transportation Recommendations:**
     * Mode: Details
     * Mode: Details
-
     **Budget Allocation Recommendations:**
     * Flights: Amount
     * Accommodation: Amount
@@ -413,13 +436,12 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
     * Activities: Amount
     * Food: Amount
     * Miscellaneous: Amount
-
     **Special Considerations:**
     * Consideration 1
     * Consideration 2
     * Consideration 3
     """
-    
+
 
 def setup_llm():
     return GoogleGenerativeAI(
@@ -429,36 +451,30 @@ def setup_llm():
     )
 
 
+# API Endpoints
 @app.post("/generate-travel-plan", response_model=TravelResponse)
 async def generate_travel_plan(request: TravelRequest):
     try:
-        # Map input variables to MongoDB query parameters
-        star_rating = request.tripDetails.hotelType.star
-        destination_city = request.tripDetails.destination
-        
-        print(f"Searching for hotels with type: {star_rating} in city: {destination_city}")
-        
-        # Fetch matching hotels
-        matching_hotel_ids = get_matching_hotels(
-            hotel_type=star_rating,
-            destination_city=destination_city
+        # Load hotel data
+        hotels_df = load_hotel_data()
+        if hotels_df is None:
+            raise HTTPException(status_code=500, detail="Failed to load hotel data")
+
+        # Format hotels according to new structure
+        formatted_hotels = format_hotel_data(
+            hotels_df,
+            request.tripDetails.hotelType.star
         )
-        
-        if not matching_hotel_ids:
+
+        if not formatted_hotels:
             raise HTTPException(
                 status_code=404,
-                detail={
-                    "message": f"No {star_rating}-star hotels found in {destination_city}",
-                    "searched_params": {
-                        "hotel_type": star_rating,
-                        "city": destination_city
-                    }
-                }
+                detail=f"No {request.tripDetails.hotelType.star}-star hotels found matching your criteria"
             )
-        
-        # Rest of the code remains the same
+
+        # Setup LLM and generate activities
         llm = setup_llm()
-        
+
         categories = [cat for cat, val in request.tripDetails.category.dict().items() if val]
         activities_prompt = generate_activities_prompt(
             request.tripDetails.destination, 
@@ -466,23 +482,27 @@ async def generate_travel_plan(request: TravelRequest):
         )
         activities_response = llm(activities_prompt)
         activities_list = parse_llm_activities(activities_response)
-        
-        selected_hotel_id = matching_hotel_ids[0]
-        
-        itinerary_prompt = generate_llm_prompt(request.tripDetails)
+
+        # Select first hotel for itinerary
+        selected_hotel = formatted_hotels[0]
+
+        # Generate itinerary
+        itinerary_prompt = generate_enhanced_prompt(
+            request.tripDetails,
+            activities_list,
+            formatted_hotels
+        )
         itinerary_response = llm(itinerary_prompt)
-        parsed_itinerary = parse_itinerary_response(itinerary_response, selected_hotel_id)
-        
+        parsed_itinerary = parse_itinerary_response(itinerary_response, selected_hotel)
+
         return TravelResponse(
             itinerary=parsed_itinerary,
-            hotel_ids=matching_hotel_ids,
+            hotels=formatted_hotels,
             activities=activities_list
         )
-        
+
     except Exception as e:
         print(f"Error in generate_travel_plan: {e}")
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
