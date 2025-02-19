@@ -126,6 +126,7 @@ class HotelInfo(BaseModel):
 class Activity(BaseModel):
     time: str
     activity: str
+    location: str  # This will now include the city and state
 
 class DayItinerary(BaseModel):
     day: str
@@ -274,7 +275,7 @@ def search_hotels_on_google(destination: str, check_in_date: str, check_out_date
 
 def generate_activities_prompt(destination: str, categories: List[str]) -> str:
     return f"""
-    Please provide a comprehensive list of all possible activities and attractions in {destination}. 
+    Please provide a comprehensive list of all possible activities and attractions inside and near {destination}. 
     Focus particularly on these categories: {', '.join(categories)}.
     generate top 25 only.
     Include:
@@ -312,16 +313,18 @@ def parse_itinerary_response(llm_response: str, selected_hotel: Optional[HotelIn
                 "Special_Considerations": None
             }
             
-            activities = re.findall(r'\* \*\*([\w\s]+):\*\* (.*?)(?=\n|$)', section, re.DOTALL)
+            # Parse activities and locations
+            activities = re.findall(r'\* \*\*([\w\s]+):\*\*\s*- Activity: (.*?)\s*- Location: (.*?)(?=\n|$)', section, re.DOTALL)
             if not activities:
-                activities = re.findall(r'\*\*([\w\s]+):\*\* (.*?)(?=\n(?:\*|$)|$)', section, re.DOTALL)
+                activities = re.findall(r'\*\*([\w\s]+):\*\*\s*- Activity: (.*?)\s*- Location: (.*?)(?=\n|$)', section, re.DOTALL)
             
-            for time, activity in activities:
+            for time, activity, location in activities:
                 current_day["activities"].append(Activity(
                     time=time.strip(),
-                    activity=activity.strip()
+                    activity=activity.strip(),
+                    location=location.strip()  # Use the explicitly provided location, which now includes city and state
                 ))
-        
+           
         # Handle special sections (keep the same as before)
         elif 'Transportation Recommendations' in section:
             transport_items = re.findall(r'\* (.*?)(?=\n|$)', section)
@@ -362,13 +365,22 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
 
     return f"""
     Create a detailed travel itinerary for a trip to {trip_details.destination} from {trip_details.dateOfTravel.from_} to {trip_details.dateOfTravel.to}. 
-    Please format the output exactly as shown in this example:
+    try to keep itinerary in a set which are closer to each other for each specific day.
+    Please format the output exactly as shown in this example, dont use this example's data, only the schema.:
 
     **Day 1 (YYYY-MM-DD)**
-    * **Morning:** Activity description here
-    * **Afternoon:** Activity description here
-    * **Evening:** Activity description here
-    * **Dinner:** Restaurant recommendation here
+    * **Morning:** 
+      - Activity: Visit the Calico Museum of Textiles, showcasing a vast collection of Indian textiles from different regions and eras.
+      - Location: Calico Museum of Textiles, Ahmedabad, Gujarat
+    * **Afternoon:** 
+      - Activity: Take a guided tour of the Adalaj Stepwell, an intricate 15th-century stepwell with seven levels.
+      - Location: Adalaj Stepwell, Adalaj, Gujarat
+    * **Evening:** 
+      - Activity: Attend a traditional Gujarati folk dance performance at the Science City.
+      - Location: Science City, Ahmedabad, Gujarat
+    * **Dinner:** 
+      - Activity: Enjoy a vegetarian dinner at Atithi Dining Hall, known for its Gujarati thalis.
+      - Location: Atithi Dining Hall, Ahmedabad, Gujarat
 
     Consider these preferences and requirements:
     Trip Categories: {', '.join(categories)}
@@ -397,6 +409,8 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
     * Consideration 1
     * Consideration 2
     * Consideration 3
+
+    Remember: All locations must be real, existing places that can be found through a Google search. Use complete, official names for all locations, and include the city and state in the location details.
     """
 def parse_llm_activities(llm_response: str) -> List[str]:
     """
