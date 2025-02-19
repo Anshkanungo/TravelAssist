@@ -4,7 +4,7 @@ from typing import List, Dict, Optional, Union
 import google.generativeai as genai
 
 # Configure Gemini API
-GOOGLE_API_KEY = "AIzaSyAPh9Wva_MeDs5xp71NxWMSZJ-1_UOA8DE"  # Replace with your actual API key
+GOOGLE_API_KEY = ""  # Replace with your actual API key
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-flash')
 
