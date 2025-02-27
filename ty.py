@@ -139,7 +139,7 @@ class DayItinerary(BaseModel):
 class TravelResponse(BaseModel):
     itinerary: List[DayItinerary]
     hotels: List[HotelInfo]  
-    activities: List[str]
+    activities: List[Dict[str, str]]  # Include activity name and location
     additional_hotels: Optional[List[HotelInfo]] = None 
 
 # Helper Functions
@@ -297,6 +297,15 @@ def parse_itinerary_response(llm_response: str, selected_hotel: Optional[HotelIn
 
         if section.startswith('**Day'):
             if current_day:
+                # Ensure at least one set of activities exists
+                if not current_day["activities"]:
+                    print("Warning: No activities found for the day. Falling back to default activities.")
+                    current_day["activities"] = [
+                        Activity(time="Morning", activity="Default Morning Activity", location="Default Location"),
+                        Activity(time="Afternoon", activity="Default Afternoon Activity", location="Default Location"),
+                        Activity(time="Evening", activity="Default Evening Activity", location="Default Location"),
+                        Activity(time="Dinner", activity="Default Dinner Activity", location="Default Location")
+                    ]
                 current_day["hotel"] = selected_hotel  # Use full hotel details
                 if special_section:
                     current_day.update(special_section)
@@ -350,6 +359,15 @@ def parse_itinerary_response(llm_response: str, selected_hotel: Optional[HotelIn
 
     # Add the last day if exists
     if current_day:
+        # Ensure at least one set of activities exists
+        if not current_day["activities"]:
+            print("Warning: No activities found for the day. Falling back to default activities.")
+            current_day["activities"] = [
+                Activity(time="Morning", activity="Default Morning Activity", location="Default Location"),
+                Activity(time="Afternoon", activity="Default Afternoon Activity", location="Default Location"),
+                Activity(time="Evening", activity="Default Evening Activity", location="Default Location"),
+                Activity(time="Dinner", activity="Default Dinner Activity", location="Default Location")
+            ]
         current_day["hotel"] = selected_hotel  # Use full hotel details
         if special_section:
             current_day.update(special_section)
@@ -365,10 +383,21 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
 
     return f"""
     Create a detailed travel itinerary for a trip to {trip_details.destination} from {trip_details.dateOfTravel.from_} to {trip_details.dateOfTravel.to}. 
-    try to keep itinerary in a set which are closer to each other for each specific day.
-    Please format the output exactly as shown in this example, dont use this example's data, only the schema.:
+    Ensure that each day includes activities that are close to each other geographically, so travelers don't have to travel long distances within a single day.
 
-    **Day 1 (YYYY-MM-DD)**
+    For each day, include the following:
+    - Morning activity
+    - Afternoon activity
+    - Evening activity
+    - Dinner location
+
+    **Important Notes:**
+    1. All activities must be real, existing places that can be found on Google Maps.
+    2. Use complete, official names for all locations, and include the city and state in the location details.
+    3. Ensure that activities for each day are within a 10-15 km radius of each other.
+
+    **Example Format:**
+    **Day 1 (2025-01-09)**
     * **Morning:** 
       - Activity: Visit the Calico Museum of Textiles, showcasing a vast collection of Indian textiles from different regions and eras.
       - Location: Calico Museum of Textiles, Ahmedabad, Gujarat
@@ -409,9 +438,8 @@ def generate_llm_prompt(trip_details: TripDetails) -> str:
     * Consideration 1
     * Consideration 2
     * Consideration 3
-
-    Remember: All locations must be real, existing places that can be found through a Google search. Use complete, official names for all locations, and include the city and state in the location details.
     """
+
 def parse_llm_activities(llm_response: str) -> List[str]:
     """
     Parses the LLM response for activities and returns a clean list of strings.
@@ -460,10 +488,11 @@ def parse_llm_activities(llm_response: str) -> List[str]:
     
 def setup_llm():
     return GoogleGenerativeAI(
-        model="gemini-pro",
+        model="gemini-2.0-flash-lite",
         google_api_key=os.environ.get('GOOGLE_API_KEY'),
         temperature=0.2
     )
+
 
 # API Endpoint
 @app.post("/generate-travel-plan", response_model=TravelResponse)
@@ -483,7 +512,6 @@ async def generate_travel_plan(request: TravelRequest):
             travel_dates=travel_dates
         )
         
-        
         additional_hotels = []
         if not matching_hotels:
             # If no hotels found in MongoDB, search on Google Hotels API
@@ -499,6 +527,8 @@ async def generate_travel_plan(request: TravelRequest):
         # Rest of the code remains the same
         llm = setup_llm()
         
+
+
         categories = [cat for cat, val in request.tripDetails.category.dict().items() if val]
         activities_prompt = generate_activities_prompt(
             request.tripDetails.destination, 
@@ -513,12 +543,22 @@ async def generate_travel_plan(request: TravelRequest):
         
         itinerary_prompt = generate_llm_prompt(request.tripDetails)
         itinerary_response = llm.invoke(itinerary_prompt)  # Use invoke instead of __call__
+        print("LLM Response:", itinerary_response)  # Debugging log
         parsed_itinerary = parse_itinerary_response(itinerary_response, selected_hotel)
+        
+        # Extract activities from the parsed itinerary
+        activities_with_location = []
+        for day in parsed_itinerary:
+            for activity in day.activities:
+                activities_with_location.append({
+                    "name": activity.activity,
+                    "location": activity.location
+                })
         
         return TravelResponse(
             itinerary=parsed_itinerary,
             hotels=matching_hotels if matching_hotels else [],  # Empty if no hotels found in MongoDB
-            activities=activities_list,
+            activities=activities_with_location,  # Use activities with name and location
             additional_hotels=additional_hotels  # Include Google Hotels API results
         )
         
