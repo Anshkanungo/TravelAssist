@@ -25,6 +25,16 @@ cars_collection = db.cars
 # SerpApi endpoint for Google Hotels
 SERPAPI_URL = "https://serpapi.com/search"
 SERPAPI_KEY = os.environ.get('SERPAPI_KEY')
+if not SERPAPI_KEY:
+    raise ValueError("SERPAPI_KEY not found in environment variables. Please set it in the .env file.")
+if not SERPAPI_KEY.startswith('c'):
+    raise ValueError(f"SERPAPI_KEY does not start with 'c'. Got: {SERPAPI_KEY[:10]}... Check .env file or system environment variables.")
+
+# Debug print to verify
+print(f"SERPAPI_KEY: {SERPAPI_KEY}")
+
+
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -212,6 +222,9 @@ def get_matching_hotels(hotel_type: int, destination_city: str, travel_dates: Da
 
 def search_hotels_on_google(destination: str, check_in_date: str, check_out_date: str, adults: int, children: int, rooms: int) -> List[HotelInfo]:
     try:
+        # Ensure adults is at least 1
+        adults = max(1, adults)
+        
         params = {
             "engine": "google_hotels",
             "q": f"hotels in {destination}",
@@ -226,21 +239,32 @@ def search_hotels_on_google(destination: str, check_in_date: str, check_out_date
         }
         
         response = requests.get(SERPAPI_URL, params=params)
-        response.raise_for_status()
+        response.raise_for_status()  # Raises an exception for 4xx/5xx errors
         data = response.json()
         
         hotels = []
         if 'properties' in data:
             for hotel in data['properties'][:5]:
+                price = hotel.get('rate_per_night', {}).get('lowest', 'Price not available')
+                # Ensure price is a string for consistency
+                if isinstance(price, dict):
+                    price = str(price.get('lowest', 'Price not available'))
+                
                 hotel_info = {
                     "id": None,
                     "name": hotel.get('name', 'N/A'),
-                    "price_per_night": hotel.get('rate_per_night', {}).get('lowest', 'Price not available'),
+                    "price_per_night": {"Adult": price, "Child": price},  # Adjust if child pricing differs
                     "photos": [img.get('original_image', '') for img in hotel.get('images', []) if img.get('original_image')],
-                    "link": hotel.get('link', 'N/A')
+                    "link": hotel.get('link', 'N/A'),
+                    "address": hotel.get('address', 'N/A')
                 }
                 hotels.append(HotelInfo(**hotel_info))
         return hotels
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred: {http_err}")
+        if response.status_code == 401:
+            print("Unauthorized: Check if SERPAPI_KEY is valid and correctly set in .env")
+        return []
     except Exception as e:
         print(f"Error searching hotels on Google Hotels API: {e}")
         return []
@@ -485,14 +509,12 @@ async def generate_travel_plan(request: TravelRequest):
         elif not isinstance(itinerary_response, str):
             itinerary_response = str(itinerary_response)
         
-        print("Raw Itinerary Response:", itinerary_response)
         
         # Extract first line (optional, since no intro text is requested)
         first_line = itinerary_response.split('\n')[0].strip()
         
         # Parse the simple itinerary
         parsed_itinerary = parse_simple_itinerary(itinerary_response, selected_hotel, selected_car)
-        print("Parsed Itinerary:", parsed_itinerary)
         
         activities_with_location = [{"name": activity.activity, "location": activity.location} 
                                    for day in parsed_itinerary 
