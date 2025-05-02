@@ -21,6 +21,7 @@ client = MongoClient(os.environ.get('MONGODB_URI'))
 db = client.get_database('syt_final')
 hotels_collection = db.hotel_syts
 cars_collection = db.cars
+vendorcars_collection = db.vendorcars  # Added vendorcars collection
 
 # SerpApi endpoint for Google Hotels
 SERPAPI_URL = "https://serpapi.com/search"
@@ -135,7 +136,8 @@ class CarInfo(BaseModel):
     name: str
     photo: str
     seats: int
-    price_per_km: str
+    price_per_km: Union[int, str]  # Allow int or str to handle MongoDB data
+    min_price_per_day: Union[int, str]  # Added min_price_per_day
 
 class Activity(BaseModel):
     time: str
@@ -382,7 +384,7 @@ def parse_simple_itinerary(llm_response: str, selected_hotel: Optional[HotelInfo
                 itinerary.append(DayItinerary(
                     day=current_day,
                     hotel=selected_hotel,
-                    car=selected_car,
+                    car=selected_car,  # This includes price_per_km and min_price_per_day
                     activities=activities,
                     **special_sections.get(current_day, {})
                 ))
@@ -444,7 +446,7 @@ def parse_simple_itinerary(llm_response: str, selected_hotel: Optional[HotelInfo
         itinerary.append(DayItinerary(
             day=current_day,
             hotel=selected_hotel,
-            car=selected_car,
+            car=selected_car,  # This includes price_per_km and min_price_per_day
             activities=activities,
             **special_sections.get(current_day, {})
         ))
@@ -468,8 +470,14 @@ async def generate_travel_plan(request: TravelRequest):
         
         print(f"Searching for hotels with type: {star_rating} in city: {destination_city}")
         
-        matching_hotels = get_matching_hotels(hotel_type=star_rating, destination_city=destination_city, travel_dates=travel_dates)
+        # Fetch matching hotels from MongoDB
+        matching_hotels = get_matching_hotels(
+            hotel_type=star_rating,
+            destination_city=destination_city,
+            travel_dates=travel_dates
+        )
         
+        # Fetch additional hotels from Google if no matches found
         additional_hotels = []
         if not matching_hotels:
             additional_hotels = search_hotels_on_google(
@@ -481,25 +489,37 @@ async def generate_travel_plan(request: TravelRequest):
                 rooms=1
             )
         
+        # Fetch cars from cars and vendorcars collections
+        cars_list = []
         cars = list(cars_collection.find())
-        cars_list = [CarInfo(
-            id=str(car['_id']),
-            name=car['car_name'],
-            photo=car['photo'],
-            seats=car['car_seats'],
-            price_per_km=car['price_per_km']
-        ) for car in cars]
+        for car in cars:
+            car_id = str(car['_id'])
+            # Find matching vendorcar by car_id
+            vendorcar = vendorcars_collection.find_one({"car_id": ObjectId(car_id)})
+            if vendorcar:
+                cars_list.append(CarInfo(
+                    id=car_id,
+                    name=car['car_name'],
+                    photo=car['photo'],
+                    seats=car['car_seats'],
+                    price_per_km=vendorcar['price_per_km'],
+                    min_price_per_day=vendorcar['min_price_per_day']
+                ))
         
+        # Select first car and hotel if available
         selected_car = cars_list[0] if cars_list else None
         selected_hotel = matching_hotels[0] if matching_hotels else None
         
+        # Initialize LLM
         llm = setup_llm()
         
+        # Generate activities
         categories = [cat for cat, val in request.tripDetails.category.dict().items() if val]
         activities_prompt = generate_activities_prompt(request.tripDetails.destination, categories)
         activities_response = llm.invoke(activities_prompt)
         activities_list = parse_llm_activities(activities_response)
         
+        # Generate itinerary
         itinerary_prompt = generate_llm_prompt(request.tripDetails)
         itinerary_response = llm.invoke(itinerary_prompt)
         
@@ -509,27 +529,31 @@ async def generate_travel_plan(request: TravelRequest):
         elif not isinstance(itinerary_response, str):
             itinerary_response = str(itinerary_response)
         
-        
-        # Extract first line (optional, since no intro text is requested)
-        first_line = itinerary_response.split('\n')[0].strip()
-        
-        # Parse the simple itinerary
+        # Parse the itinerary
         parsed_itinerary = parse_simple_itinerary(itinerary_response, selected_hotel, selected_car)
         
-        activities_with_location = [{"name": activity.activity, "location": activity.location} 
-                                   for day in parsed_itinerary 
-                                   for activity in day.activities]
+        # Create activities list with locations
+        activities_with_location = [
+            {"name": activity.activity, "location": activity.location}
+            for day in parsed_itinerary
+            for activity in day.activities
+        ]
         
+        # Fallback to activities_list if no activities found
         if not activities_with_location:
-            activities_with_location = [{"name": activity, "location": destination_city} for activity in activities_list]
+            activities_with_location = [
+                {"name": activity, "location": destination_city}
+                for activity in activities_list
+            ]
         
+        # Return response
         return TravelResponse(
             itinerary=parsed_itinerary,
             Hotel_list=matching_hotels if matching_hotels else [],
             activities=activities_with_location,
             Google_hotels=additional_hotels,
             cars=cars_list,
-            llm_intro=first_line
+            llm_intro=itinerary_response.split('\n')[0].strip()
         )
     except Exception as e:
         print(f"Error in generate_travel_plan: {e}")
