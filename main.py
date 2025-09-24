@@ -164,7 +164,7 @@ def generate_itinerary_and_activities(llm, user_data):
 def setup_llm():
     """Initialize the Gemini model with LangChain."""
     llm = GoogleGenerativeAI(
-        model="gemini-pro",
+        model="gemini-2.0-flash-lite",
         google_api_key=os.environ.get('GOOGLE_API_KEY'),
         temperature=0.2
     )
